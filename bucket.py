@@ -1,44 +1,54 @@
-from fastapi import HTTPException, Request, Response, status
+from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 import time
-from typing import Dict
 
 from src.config import config
+from src.database import redis
+from src.schemas.common import Bucket
 
-# 클라이언트별 버킷을 저장할 딕셔너리
-buckets: Dict[str, Dict] = {}
-
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+    
+# 토큰 버킷 알고리즘 
+class BucketRateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if not request.client:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="요청에 client 속성이 없습니다.",
+                content={"detail": "요청에 client 속성이 없습니다."}
             )
         client_ip = request.client.host
         current_time = time.time()
+        bucket_key = f"bucket:{client_ip}"
+        bucket_data  = await redis.hgetall(bucket_key)
+        if not bucket_data :
+            bucket = Bucket(tokens=config.BUCKET_SIZE, last_refill=current_time)
+        else:
+            bucket = Bucket.model_validate(bucket_data)
+        time_passed = current_time - bucket.last_refill
 
-        if client_ip not in buckets:
-            buckets[client_ip] = {
-                "tokens": config.bucket_size,
-                "last_refill": current_time
-            }
+        # 정수로 계산하기 위해 형변환
+        refill_amount = int(time_passed * (config.REQUESTS_PER_MINUTE / 60))
+        bucket.tokens = min(bucket.tokens + refill_amount, config.BUCKET_SIZE)
+        bucket.last_refill = current_time
 
-        bucket = buckets[client_ip]
-        time_passed = current_time - bucket["last_refill"]
-        refill_amount = time_passed * (config.requests_per_minute / 60)
-
-        bucket["tokens"] = min(bucket["tokens"] + refill_amount, config.bucket_size)
-        bucket["last_refill"] = current_time
-
-        if bucket["tokens"] < 1:
+        retry_after = max(0, int((1 - bucket.tokens) / (config.REQUESTS_PER_MINUTE / 60)))
+        if bucket.tokens < 1:
             return JSONResponse(
-                status_code=429,
-                content={"message": "Rate limit exceeded. Please try again later."}
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "처리율 제한을 초과하였습니다. 나중에 다시 시도해주세요"},
+                headers={
+                    "X-Ratelimit-Retry-After": str(retry_after),
+                    "X-Ratelimit-Remaining": str(bucket.tokens),
+                    "X-Ratelimit-Limit": str(config.BUCKET_SIZE)
+                }
             )
+        await redis.hset(bucket_key, "tokens", bucket.tokens - 1)
+        await redis.hset(bucket_key, "last_refill", current_time)
+        response: Response = await call_next(request)
 
-        bucket["tokens"] -= 1
-        response = await call_next(request)
+        # 처리율 제한 헤더
+        response.headers.append(key="X-Ratelimit-Remaining", value=str(bucket.tokens))
+        response.headers.append(key="X-Ratelimit-Limit", value=str(config.BUCKET_SIZE))
+        response.headers.append(key="X-Ratelimit-Retry-After", value=str(retry_after))
+
         return response
-
